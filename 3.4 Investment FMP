@@ -1,0 +1,411 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy import stats
+from pathlib import Path
+from typing import Dict, List, Tuple
+import statsmodels.api as sm    # for Newey–West HAC t‑statistic
+from pandas.tseries.offsets import MonthEnd
+
+
+#============================
+#   User Parameters
+#============================
+input_data_path    = Path("1. Total Return.parquet")
+riskfree_data_path = Path("/Users/leonikwadehn/Documents/Uni/ISEG/MFW/Python/Try 8/RF.xlsx")
+
+analysis_start     = "2006-12-31"
+analysis_end       = "2024-12-31"
+
+# How often to form the portfolios: 'Monthly', 'Quarterly', or 'Annual'
+formation_frequency = "Quarterly"
+# How to split assets into groups: 'Median', 'Quintiles', or '304030'
+grouping_method     = "Median"
+# How to weight returns in each group: 'Equal' or 'Value'
+weighting_scheme    = "Value"
+
+# Winsorization trims extreme values to reduce outlier effects
+winsor_lower_q      = 0.0025
+winsor_upper_q      = 0.9975
+
+# Where to save output files
+results_dir = Path("/Users/leonikwadehn/Documents/Uni/ISEG/MFW/Python/Try 8/Factor Outputs")
+results_dir.mkdir(parents=True, exist_ok=True)
+
+
+#============================
+#   Helper Functions
+#============================
+def winsorize(series: pd.Series,
+              lower_q: float = winsor_lower_q,
+              upper_q: float = winsor_upper_q) -> pd.Series:
+    """Clip a Series at its (lower_q, upper_q) quantiles."""
+    lo = series.quantile(lower_q)
+    hi = series.quantile(upper_q)
+    return series.clip(lower=lo, upper=hi)
+
+
+def compute_group_breakpoints(measure: pd.Series,
+                              method: str = "median") -> Dict[str, float]:
+    """
+    For the chosen grouping_method, return the numeric thresholds
+    defining the 'low' vs 'high' groups.
+    """
+    m = method.lower()
+    if m == "median":
+        cut = measure.median()
+        return {"low": cut, "high": cut}
+    elif m == "quintiles":
+        return {"low": measure.quantile(0.2),
+                "high": measure.quantile(0.8)}
+    elif m in ("304030", "30/40/30"):
+        return {"low": measure.quantile(0.3),
+                "high": measure.quantile(0.7)}
+    else:
+        raise ValueError("grouping_method must be 'Median', 'Quintiles', or '304030'.")
+
+
+def assign_groups(measure: pd.Series,
+                  breakpoints: Dict[str, float],
+                  method: str = "median") -> Tuple[List[str], List[str]]:
+    """
+    Split assets into 'low' and 'high' groups based on breakpoints.
+    Returns two lists of asset IDs.
+    """
+    m = method.lower()
+    if m == "median":
+        low_grp  = measure[measure <  breakpoints["low"]].index.tolist()
+        high_grp = measure[measure >  breakpoints["high"]].index.tolist()
+    elif m in ("quintiles", "304030", "30/40/30"):
+        low_grp  = measure[measure <= breakpoints["low"]].index.tolist()
+        high_grp = measure[measure >= breakpoints["high"]].index.tolist()
+    else:
+        raise ValueError("Unsupported grouping_method.")
+    return low_grp, high_grp
+
+
+def construct_factor_series(data: pd.DataFrame,
+                            frequency: str = "Monthly",
+                            grouping_method: str = "Median",
+                            weighting: str = "Value") -> pd.DataFrame:
+    """
+    Build the time series of investment factor returns = 
+      (Low‐growth portfolio return) – (High‐growth portfolio return).
+
+    1) On each formation date (by freq), compute non‐cash‐assets growth:
+         NC = Total Assets – Cash and Cash Equivalents
+         Growth = (NC_cur / NC_lag) – 1
+       where lag = 1/3/12 months for Monthly/Quarterly/Annual.
+    2) Winsorize growth, split into low/high by grouping_method.
+    3) For each subsequent period, apply out‐of‐sample lag.
+    4) Compute equal‐ or value‐weighted returns of each group, then subtract.
+    """
+
+    print(f"→ START {frequency=}  {grouping_method=}  {weighting=}")
+    freq = frequency.lower()
+    # 1. Identify formation dates
+    if freq == "monthly":
+        formation_dates = sorted(data["Date"].unique())
+        offset = 1
+    elif freq == "quarterly":
+        formation_dates = data.groupby(data["Date"].dt.to_period("Q"))["Date"] \
+                               .max().sort_values().tolist()
+        offset = 3
+    elif freq == "annual":
+        formation_dates = data.groupby(data["Date"].dt.to_period("Y-JUN"))["Date"] \
+                               .max().sort_values().tolist()
+        offset = 12
+    else:
+        raise ValueError("frequency must be 'Monthly', 'Quarterly', or 'Annual'.")
+
+    # 2. On each formation date, determine low/high Investment Growth groups
+    formation_map: Dict[pd.Timestamp, Dict] = {}
+    for form_date in formation_dates:
+        dt = pd.to_datetime(form_date)
+        subset = data[data["Date"] == dt][
+            ["Company", "Total Assets", "Cash and Cash Equivalents", "Historical Market Cap", "Total Return"]
+        ].copy()
+        if subset.empty:
+            continue
+
+        # compute current non‑cash assets
+        subset["NonCash"] = subset["Total Assets"] - subset["Cash and Cash Equivalents"]
+
+        # vectorized lagged non‑cash: grab all history == lag cutoff
+        lag_cutoff = dt - MonthEnd(offset)
+        hist       = data[data['Date'] == lag_cutoff][
+            ["Company", "Date", "Total Assets", "Cash and Cash Equivalents"]
+        ].copy()
+        hist["NonCash"] = hist["Total Assets"] - hist["Cash and Cash Equivalents"]
+
+        # for each company, keep only the most recent (by Date)
+        last_nc = (
+            hist.sort_values(["Company", "Date"])
+                .groupby("Company")
+                .last()["NonCash"]
+        )
+        # drop non‑positive lag NC
+        last_nc = last_nc[last_nc > 0]
+        if last_nc.empty:
+            continue
+
+        # merge lag back to this formation‐date subset
+        subset = subset.merge(
+            last_nc.rename("NonCashLag"),
+            left_on="Company",
+            right_index=True,
+            how="inner"
+        )
+        # compute growth in one vectorized step
+        subset["Growth"] = subset["NonCash"] / subset["NonCashLag"] - 1
+
+        # winsorize & split into groups
+        growth_s = subset.set_index("Company")["Growth"]
+        win_g    = winsorize(growth_s)
+        bp       = compute_group_breakpoints(win_g, grouping_method)
+        low_ids, high_ids = assign_groups(win_g, bp, grouping_method)
+
+        if weighting.lower() == "value":
+            mcap = subset.set_index("Company")["Historical Market Cap"]
+            formation_map[dt] = {
+                "low_ids":  low_ids,
+                "high_ids": high_ids,
+                "low_wts":  mcap.loc[low_ids],
+                "high_wts": mcap.loc[high_ids]
+            }
+        else:
+            formation_map[dt] = {"low_ids": low_ids, "high_ids": high_ids}
+
+    # 3. For each period, find the most recent formation date < period, compute returns
+    records = []
+    for period in sorted(data["Date"].unique()):
+        dt = pd.to_datetime(period)
+        valid_forms = [d for d in formation_map if d < dt]
+        if not valid_forms:
+            continue
+        use_form = max(valid_forms)  # most recent formation date
+        assign  = formation_map[use_form]
+        period_df = data[data["Date"] == dt]
+
+        # Compute portfolio returns
+        if weighting.lower() == "equal":
+            low_ret  = period_df[period_df["Company"].isin(assign["low_ids"])]["Total Return"].mean()
+            high_ret = period_df[period_df["Company"].isin(assign["high_ids"])]["Total Return"].mean()
+        else:
+            # value-weighted
+            low_data  = period_df[period_df["Company"].isin(assign["low_ids"])]
+            high_data = period_df[period_df["Company"].isin(assign["high_ids"])]
+            if not low_data.empty:
+                r_low = low_data.set_index("Company")["Total Return"]
+                w_low = assign["low_wts"].loc[r_low.index]
+                low_ret = np.average(r_low.reindex(w_low.index), weights=w_low)
+            else:
+                low_ret = np.nan
+            if not high_data.empty:
+                r_high = high_data.set_index("Company")["Total Return"]
+                w_high = assign["high_wts"].loc[r_high.index]
+                high_ret = np.average(r_high.reindex(w_high.index), weights=w_high)
+            else:
+                high_ret = np.nan
+
+        # Low-minus-high
+        records.append((dt, low_ret - high_ret))
+
+    factor_df = pd.DataFrame(records, columns=["Date", "FactorReturn"])
+    factor_df.dropna(subset=["FactorReturn"], inplace=True)
+    factor_df.reset_index(drop=True, inplace=True)
+    factor_df["Date"] = (
+        factor_df["Date"]
+            .dt.to_period("M")
+            .dt.to_timestamp(how="end")
+    )
+    return factor_df
+
+
+
+def load_riskfree_rate(path: Path) -> pd.DataFrame:
+    """
+    Read monthly risk-free rates from Excel and snap each date to month‑end.
+    """
+    rf = pd.read_excel(path, header=None)
+    rf.columns = ["Date", "RF"]
+    rf["Date"] = pd.to_datetime(rf["Date"], errors="coerce") \
+                   .dt.to_period("M") \
+                   .dt.to_timestamp(how="end")
+    rf.dropna(subset=["Date"], inplace=True)
+    #turn annualized EURIBOR into per‑month return
+    # Act/360: monthly return ≈ RF_ann * (days_in_month/360)
+    rf["Days"] = rf["Date"].dt.daysinmonth
+    rf["RF"] = rf["RF"] * rf["Days"] / 360
+    return rf
+
+
+def merge_with_riskfree(factor_df: pd.DataFrame,
+                        rf_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Left‑join factor returns to RF compute excess return.
+    """
+    merged = factor_df.merge(rf_df, on="Date", how="left")
+    merged["ExcessReturn"] = merged["FactorReturn"] - merged["RF"]
+    return merged
+
+
+def compute_statistics(factor: pd.Series, excess: pd.Series) -> Dict[str, str]:
+    """
+    Return summary stats: mean, p‑value, median, vol, skew, kurt, Sharpe, Jarque‑Bera, Newey-West.
+    """
+    mean_val   = np.nanmean(factor)
+    median_val = np.nanmedian(factor)
+    vol        = np.nanstd(factor, ddof=1)
+    skewness   = stats.skew(factor, bias=False, nan_policy="omit")
+    kurtosis   = stats.kurtosis(factor, fisher=True, bias=False, nan_policy="omit") 
+    tstat, pval = stats.ttest_1samp(factor.dropna(), 0.0)
+    excess_mean = np.nanmean(excess)
+    excess_vol  = np.nanstd(excess, ddof=1)
+    sharpe      = excess_mean / excess_vol if excess_vol not in (0, np.nan) else np.nan
+    jb_stat, jb_p = stats.jarque_bera(factor.dropna())
+
+    # Newey‑West HAC t‑statistic (3 monthly lags)
+    nw_model = sm.OLS(factor.dropna(), np.ones(len(factor.dropna())))
+    nw_res   = nw_model.fit(cov_type="HAC", cov_kwds={"maxlags": 3})
+    nw_t     = nw_res.tvalues.iloc[0]  
+    nw_p     = nw_res.pvalues.iloc[0]    
+
+
+    return {
+        "Mean":          f"{mean_val:.4f}",
+        "(p-value)":     f"({pval:.3f})",
+        "Median":        f"{median_val:.4f}",
+        "Volatility":    f"{vol:.4f}",
+        "Skewness":      f"{skewness:.4f}",
+        "Kurtosis":      f"{kurtosis:.4f}",
+        "Sharpe ratio":  f"{sharpe:.4f}",
+        "Jarque-Bera":   f"{jb_stat:.2f} (p={jb_p:.3f})",
+        "NW t‑stat":    f"{nw_t:.2f} (p={nw_p:.3f})",
+    }
+
+
+def plot_period_returns(factor_df: pd.DataFrame) -> None:
+    """Bar chart of each period’s raw factor return."""
+    df = factor_df.sort_values("Date")
+    plt.figure(figsize=(14, 6))
+    plt.bar(df["Date"], df["FactorReturn"], width=20)
+    plt.axhline(0, linewidth=1, color="gray")
+    plt.xlabel("Date")
+    plt.ylabel("Period Return")
+    plt.title("Investment Factor Returns Over Time")
+    plt.xticks(rotation=45)
+    plt.grid(axis="y", linestyle="--", alpha=0.5)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_cumulative_return_series(factor_df: pd.DataFrame) -> None:
+    """Line plot of cumulative $1 growth from factor returns."""
+    series = factor_df.set_index("Date")["FactorReturn"].sort_index()
+    cum = (1 + series).cumprod()
+    plt.figure(figsize=(14, 6))
+    plt.plot(cum.index, cum.values, marker="o", linewidth=2, label="Cumulative")
+    plt.axhline(1, linestyle="--", linewidth=1, alpha=0.7)
+    plt.xlabel("Date")
+    plt.ylabel("Value of $1")
+    plt.title("Cumulative Investment Factor Return")
+    plt.legend()
+    plt.grid(linestyle="--", alpha=0.5)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_riskfree_rate(rf_df: pd.DataFrame,
+                       start: str,
+                       end: str) -> None:
+    """Line plot of the risk-free rate between two dates."""
+    s, e = pd.to_datetime(start), pd.to_datetime(end)
+    df = rf_df[(rf_df["Date"] >= s) & (rf_df["Date"] <= e)].sort_values("Date")
+    plt.figure(figsize=(14, 6))
+    plt.plot(df["Date"], df["RF"], marker="o", linewidth=2)
+    plt.xlabel("Date")
+    plt.ylabel("Risk-Free Rate")
+    plt.title("Monthly Risk‑Free Rate")
+    plt.xticks(rotation=45)
+    plt.grid(linestyle="--", alpha=0.6)
+    plt.tight_layout()
+    plt.show()
+
+
+def display_statistics(stats: Dict[str, str]) -> None:
+    """Print summary statistics in a neat table."""
+    print("\n=== Investment Factor Summary Statistics ===")
+    for metric, value in stats.items():
+        print(f"{metric:12s}: {value}")
+    print("============================================\n")
+
+
+#============================
+#   MAIN EXECUTION
+#============================
+def main() -> None:
+    try:
+        print("1) Loading input data…")
+        df = pd.read_parquet(input_data_path)
+        df["Date"] = pd.to_datetime(df["Date"])
+
+        # Keep only desired dates & measures
+        mask_time = df["Date"].between(analysis_start, analysis_end)
+        df = df[mask_time & df["Financial Measure"].isin([
+            "Total Return",
+            "Historical Market Cap",
+            "Total Assets",
+            "Cash and Cash Equivalents"
+        ])].copy()
+
+        # Pivot so each row is one (Company, Date) with needed columns
+        df_wide = (
+            df.pivot_table(
+                index=["Company", "Date"],
+                columns="Financial Measure",
+                values="Value"
+            )
+            .dropna(subset=[
+                "Historical Market Cap",
+                "Total Return",
+                "Total Assets",
+                "Cash and Cash Equivalents"
+            ])
+            .reset_index()
+        )
+
+        print("2) Forming portfolios & computing factor returns…")
+        factor_df = construct_factor_series(
+            df_wide,
+            frequency=formation_frequency,
+            grouping_method=grouping_method,
+            weighting=weighting_scheme
+        )
+
+        print("3) Loading & merging risk‑free rates…")
+        rf_df = load_riskfree_rate(riskfree_data_path)
+        merged = merge_with_riskfree(factor_df, rf_df)
+
+        stats = compute_statistics(merged["FactorReturn"], merged["ExcessReturn"])
+        display_statistics(stats)
+
+        # Save outputs
+        merged["Date"] = merged["Date"].dt.date
+        filename_base = f"Investment_{formation_frequency}_{grouping_method}"
+        merged.to_csv(results_dir / (filename_base + ".csv"), index=False)
+        merged.to_parquet(results_dir / (filename_base + ".parquet"), index=False)
+        print(f"Results saved under {results_dir}")
+
+        # Draw charts
+        plot_period_returns(merged)
+        plot_cumulative_return_series(merged)
+        plot_riskfree_rate(rf_df, analysis_start, analysis_end)
+
+    except Exception as err:
+        print(f"An error occurred: {err}")
+        raise
+
+
+if __name__ == "__main__":
+    main()
