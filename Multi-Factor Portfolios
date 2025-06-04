@@ -1,0 +1,157 @@
+import pandas as pd
+import numpy as np
+from scipy import stats
+import statsmodels.api as sm
+from scipy.optimize import minimize
+from pathlib import Path
+
+#============================
+#   User Parameters
+#============================
+factor_files = {
+    'MOM': Path('/Users/leonikwadehn/Documents/Uni/ISEG/MFW/Python/Try 8/Factor Outputs/Momentum_Monthly_Median.parquet'),
+    'SMB': Path('/Users/leonikwadehn/Documents/Uni/ISEG/MFW/Python/Try 8/Factor Outputs/Size_Quarterly_Median.parquet'),
+    'HML': Path('/Users/leonikwadehn/Documents/Uni/ISEG/MFW/Python/Try 8/Factor Outputs/Value_Quarterly_Median.parquet'),
+    'RMW': Path('/Users/leonikwadehn/Documents/Uni/ISEG/MFW/Python/Try 8/Factor Outputs/Profitability_Quarterly_Median.parquet'),
+    'CMA': Path('/Users/leonikwadehn/Documents/Uni/ISEG/MFW/Python/Try 8/Factor Outputs/Investment_Quarterly_Median.parquet'),
+}
+
+analysis_start = "2006-12-31"
+analysis_end   = "2024-12-31"
+
+strategies = ["ew", "tangency", "mvp", "risk_parity", "max_div"]
+
+results_dir = Path("./factor_outputs")
+results_dir.mkdir(exist_ok=True)
+output_excel = results_dir / "rolling12m_strategies.xlsx"
+
+#============================
+#   Helper Functions
+#============================
+def load_all_factors(files: dict) -> pd.DataFrame:
+    dfs = []
+    names = list(files.keys())
+    for i, name in enumerate(names):
+        df = pd.read_parquet(files[name])
+        # assume 'Date','FactorReturn','RF','Days' exist
+        df = df.rename(columns={'Date':'Date','FactorReturn':name,'RF':'RF','Days':'Days'})
+        df['Date'] = pd.to_datetime(df['Date'])
+        df['Date'] = df['Date'].dt.to_period('M').dt.to_timestamp('M')
+        if i == 0:
+            df['RF_m'] = df['RF'] * df['Days'] / 360
+            dfs.append(df[['Date', name, 'RF_m']])
+        else:
+            dfs.append(df[['Date', name]])
+    merged = dfs[0]
+    for df in dfs[1:]:
+        merged = merged.merge(df, on='Date', how='inner')
+    merged.set_index('Date', inplace=True)
+    return merged
+
+def compute_stats(x: pd.Series, excess: pd.Series) -> dict:
+    mean_val   = np.nanmean(x)
+    median_val = np.nanmedian(x)
+    vol        = np.nanstd(x, ddof=1)
+    skewness   = stats.skew(x, bias=False, nan_policy="omit")
+    kurtosis   = stats.kurtosis(x, fisher=True, bias=False, nan_policy="omit")
+    tstat, p   = stats.ttest_1samp(x.dropna(), 0.0)
+    exc_mean   = np.nanmean(excess)
+    exc_vol    = np.nanstd(excess, ddof=1)
+    sharpe     = exc_mean / exc_vol if exc_vol not in (0, np.nan) else np.nan
+    jb, jb_p   = stats.jarque_bera(x.dropna())
+    nw_res     = sm.OLS(x.dropna(), np.ones(len(x.dropna()))).fit(
+                    cov_type="HAC", cov_kwds={"maxlags":3})
+    nw_t       = nw_res.tvalues.iloc[0]
+    nw_p       = nw_res.pvalues.iloc[0]
+    return {
+        "Mean":               f"{mean_val:.4f}",
+        "Mean excess return": f"{exc_mean:.4f}",
+        "(p-value)":          f"({p:.3f})",
+        "Median":             f"{median_val:.4f}",
+        "Volatility":         f"{vol:.4f}",
+        "Skewness":           f"{skewness:.4f}",
+        "Kurtosis":           f"{kurtosis:.4f}",
+        "Sharpe ratio":       f"{sharpe:.4f}",
+        "Jarque-Bera":        f"{jb:.2f} (p={jb_p:.3f})",
+        "NW t-stat":          f"{nw_t:.2f} (p={nw_p:.3f})"
+    }
+
+def display_stats(name: str, stats: dict):
+    print(f"\n=== {name} Summary Statistics ===")
+    for k, v in stats.items():
+        print(f"{k:20s}: {v}")
+    print("="*60)
+
+def optimize_weights(mu: np.ndarray, Sigma: np.ndarray, kind: str) -> np.ndarray:
+    n      = len(mu)
+    init   = np.ones(n)/n
+    bounds = [(0,1)]*n
+    cons   = ({'type':'eq','fun': lambda w: w.sum()-1},)
+    def port_sharpe(w):
+        return w.dot(mu) / np.sqrt(w.dot(Sigma).dot(w))
+    if kind == "ew":
+        return init
+    if kind == "tangency":
+        obj = lambda w: -port_sharpe(w)
+    elif kind == "mvp":
+        obj = lambda w: w.dot(Sigma).dot(w)
+    elif kind == "risk_parity":
+        def obj(w):
+            V  = w.dot(Sigma).dot(w)
+            RC = w * (Sigma.dot(w)) / V
+            return ((RC - 1/n)**2).sum()
+    elif kind == "max_div":
+        vols = np.sqrt(np.diag(Sigma))
+        obj  = lambda w: - (w.dot(vols) / np.sqrt(w.dot(Sigma).dot(w)))
+    else:
+        raise ValueError(f"Unknown strategy: {kind}")
+    sol = minimize(obj, init, bounds=bounds, constraints=cons)
+    return sol.x
+
+
+#============================
+#   MAIN
+#============================
+def main():
+    data    = load_all_factors(factor_files)
+    data    = data.loc[analysis_start:analysis_end]
+    factors = list(factor_files.keys())
+    all_dates = sorted(data.index.unique())
+
+    # write all strategies into one Excel
+    with pd.ExcelWriter(output_excel, engine='xlsxwriter') as writer:
+        for strat in strategies:
+            rows = []
+            for i in range(12, len(all_dates)-1):
+                today     = all_dates[i]
+                next_date = all_dates[i+1]
+
+                window = data.loc[:today].iloc[-12:]
+                R_raw  = window[factors]
+                R_ex   = R_raw.sub(window['RF_m'], axis=0)
+
+                mu    = R_ex.mean().values
+                Sigma = R_ex.cov().values
+                w     = optimize_weights(mu, Sigma, strat)
+
+                ret_raw = (data.loc[next_date, factors].values * w).sum()
+                row = {'Date': next_date, 'Return': ret_raw}
+                for fac, wi in zip(factors, w):
+                    row[f"{fac}_weight"] = wi
+                rows.append(row)
+
+            out = pd.DataFrame(rows).set_index('Date')
+            # stats
+            rets   = out['Return']
+            excess = rets - data.loc[rets.index, 'RF_m']
+            stats  = compute_stats(rets, excess)
+            display_stats(f"{strat}", stats)
+
+            # write this sheet
+            out.to_excel(writer, sheet_name=str(strat))
+
+    print(f"\nAll strategies saved to {output_excel}")
+
+if __name__ == "__main__":
+    main()
+
