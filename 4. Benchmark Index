@@ -8,12 +8,12 @@ from pathlib import Path
 #============================
 #   User Parameters
 #============================
-riskfree_data_path   = Path('/Users/leonikwadehn/Documents/Uni/ISEG/MFW/Python/Try 8/RF.xlsx')        
-benchmark_data_path  = Path('/Users/leonikwadehn/Documents/Uni/ISEG/MFW/Python/Try 8/Index.xlsx')  
+riskfree_data_path   = Path('RF.xlsx')        
+benchmark_data_path  = Path('Index.xlsx')  
 analysis_start       = "2009-12-31"
 analysis_end         = "2024-12-31"
 
-results_dir = Path('/Users/leonikwadehn/Documents/Uni/ISEG/MFW/Python/Try 8/Factor Outputs')
+results_dir = Path('Factor Outputs')
 results_dir.mkdir(exist_ok=True)
 
 #============================
