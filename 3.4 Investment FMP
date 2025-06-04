@@ -12,7 +12,7 @@ from pandas.tseries.offsets import MonthEnd
 #   User Parameters
 #============================
 input_data_path    = Path("1. Total Return.parquet")
-riskfree_data_path = Path("/Users/leonikwadehn/Documents/Uni/ISEG/MFW/Python/Try 8/RF.xlsx")
+riskfree_data_path = Path("RF.xlsx")
 
 analysis_start     = "2006-12-31"
 analysis_end       = "2024-12-31"
@@ -29,7 +29,7 @@ winsor_lower_q      = 0.0025
 winsor_upper_q      = 0.9975
 
 # Where to save output files
-results_dir = Path("/Users/leonikwadehn/Documents/Uni/ISEG/MFW/Python/Try 8/Factor Outputs")
+results_dir = Path("Factor Outputs")
 results_dir.mkdir(parents=True, exist_ok=True)
 
 
