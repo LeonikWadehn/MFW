@@ -1,0 +1,60 @@
+# =============================================================================
+# CALCULATE TOTAL RETURN
+# =============================================================================
+
+import pandas as pd
+import numpy as np
+
+# =============================================================================
+# 1. Load Data from Parquet
+# =============================================================================
+# Load pre-processed data with various financial measures
+df = pd.read_parquet('0. Prep Data.parquet')
+
+# =============================================================================
+# 2. Compute Total Return for Each Month
+# =============================================================================
+
+# Pivot to wide format for easier computation of Total Return,
+# keeping only the 'Last Price' and 'Dividends per Share' measures.
+df_wide = df.pivot(index=["Company", "Date"], 
+                                  columns="Financial Measure", 
+                                  values="Value").reset_index()
+
+# Ensure the data is sorted by Company and Date.
+df_wide.sort_values(["Company", "Date"], inplace=True)
+
+# For each company, compute the previous month's 'Last Price'
+df_wide["Last Price_prev"] = df_wide.groupby("Company")["Last Price"].shift(1)
+
+# Compute Total Return using the formula:
+# Total Return = (Last Price_t - Last Price_{t-1} + Dividends per Share_t) / Last Price_{t-1}
+df_wide["Total Return"] = (df_wide["Last Price"] - df_wide["Last Price_prev"] + df_wide["Dividends per Share"]) / df_wide["Last Price_prev"]
+
+# If either the current or the previous month's Last Price is missing, set Total Return to NaN.
+df_wide.loc[df_wide["Last Price"].isna() | df_wide["Last Price_prev"].isna(), "Total Return"] = np.nan
+
+# Melt the Total Return column back to long format so it matches the original data structure.
+df_total_return = df_wide[["Company", "Date", "Total Return"]].copy()
+df_total_return["Financial Measure"] = "Total Return"
+df_total_return.rename(columns={"Total Return": "Value"}, inplace=True)
+
+print("Head of Total Return calculations:")
+print(df_total_return.head())
+
+# Append the computed Total Return rows to the original long DataFrame.
+df_monthly_final = pd.concat([df, df_total_return], ignore_index=True)
+df_monthly_final.sort_values(["Company", "Date", "Financial Measure"], inplace=True)
+
+
+# =============================================================================
+# 3. Save the Updated Data with Total Return and Print
+# =============================================================================
+df_monthly_final_parquet = "1. Total Return.parquet"
+df_monthly_final_csv = "1. Total Return.csv"
+df_monthly_final.to_parquet(df_monthly_final_parquet, engine="pyarrow", index=False)
+df_monthly_final.to_csv(df_monthly_final_csv, index=False)
+
+print("Total Return computed and data saved to '{}' and '{}' successfully!".format(
+    df_monthly_final_parquet, df_monthly_final_csv
+))
