@@ -9,11 +9,11 @@ from pathlib import Path
 #   User Parameters
 #============================
 factor_files = {
-    'MOM': Path('/Users/leonikwadehn/Documents/Uni/ISEG/MFW/Python/Try 8/Factor Outputs/Momentum_Monthly_Median.parquet'),
-    'SMB': Path('/Users/leonikwadehn/Documents/Uni/ISEG/MFW/Python/Try 8/Factor Outputs/Size_Quarterly_Median.parquet'),
-    'HML': Path('/Users/leonikwadehn/Documents/Uni/ISEG/MFW/Python/Try 8/Factor Outputs/Value_Quarterly_Median.parquet'),
-    'RMW': Path('/Users/leonikwadehn/Documents/Uni/ISEG/MFW/Python/Try 8/Factor Outputs/Profitability_Quarterly_Median.parquet'),
-    'CMA': Path('/Users/leonikwadehn/Documents/Uni/ISEG/MFW/Python/Try 8/Factor Outputs/Investment_Quarterly_Median.parquet'),
+    'MOM': Path('Momentum_Monthly_Median.parquet'),
+    'SMB': Path('Size_Quarterly_Median.parquet'),
+    'HML': Path('Value_Quarterly_Median.parquet'),
+    'RMW': Path('Profitability_Quarterly_Median.parquet'),
+    'CMA': Path('Investment_Quarterly_Median.parquet'),
 }
 
 analysis_start = "2006-12-31"
