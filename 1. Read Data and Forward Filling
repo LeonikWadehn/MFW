@@ -7,7 +7,7 @@ import pandas as pd
 # =============================================================================
 # 1. Load the New Excel File (with repeated blocks)
 # =============================================================================
-file_path = '/Users/leonikwadehn/Documents/Uni/ISEG/MFW/Python/Try 8/25.03.2025 Bloomberg New Fields Clean.xlsx'
+file_path = 'xlsx'
 df = pd.read_excel(file_path, header=None)
 
 # Determine total number of columns and number of blocks.
