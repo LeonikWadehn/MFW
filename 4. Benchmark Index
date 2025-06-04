@@ -1,0 +1,131 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy import stats
+import statsmodels.api as sm    # for Newey–West HAC t‑statistic
+from pathlib import Path
+
+#============================
+#   User Parameters
+#============================
+riskfree_data_path   = Path('/Users/leonikwadehn/Documents/Uni/ISEG/MFW/Python/Try 8/RF.xlsx')        
+benchmark_data_path  = Path('/Users/leonikwadehn/Documents/Uni/ISEG/MFW/Python/Try 8/Index.xlsx')  
+analysis_start       = "2009-12-31"
+analysis_end         = "2024-12-31"
+
+results_dir = Path('/Users/leonikwadehn/Documents/Uni/ISEG/MFW/Python/Try 8/Factor Outputs')
+results_dir.mkdir(exist_ok=True)
+
+#============================
+#   Helper Functions
+#============================
+def load_raw_series(path: Path, col_name: str) -> pd.DataFrame:
+    """Load Date/Value file, parse Date but don’t snap yet."""
+    df = pd.read_excel(path, header=None)
+    df.columns = ["Date", col_name]
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df.dropna(subset=["Date"], inplace=True)
+    return df
+
+def snap_to_month_end(df: pd.DataFrame, date_col: str) -> pd.DataFrame:
+    """Convert a datetime column to month-end timestamps."""
+    df = df.copy()
+    df[date_col] = (
+        df[date_col]
+          .dt.to_period("M")
+          .dt.to_timestamp(how="end")
+    )
+    return df
+
+def merge_with_riskfree(bm_df: pd.DataFrame,
+                        rf_df: pd.DataFrame) -> pd.DataFrame:
+    merged = bm_df.merge(rf_df, on="Date", how="left")
+    merged["ExcessReturn"] = merged["Benchmark"] - merged["RF"]
+    return merged
+
+def compute_statistics(series: pd.Series,
+                       excess: pd.Series) -> dict:
+    """
+    Return summary stats: mean, mean excess, p‑value, median, vol, skew,
+    kurt, Sharpe, Jarque‑Bera, Newey‑West t‑stat.
+    """
+    # raw series stats
+    mean_val     = np.nanmean(series)
+    median_val   = np.nanmedian(series)
+    vol          = np.nanstd(series, ddof=1)
+    skewness     = stats.skew(series, bias=False, nan_policy="omit")
+    kurtosis = stats.kurtosis(series, fisher=True, bias=False, nan_policy="omit") 
+    tstat, pval  = stats.ttest_1samp(series.dropna(), 0.0)
+
+    # excess stats
+    excess_mean  = np.nanmean(excess)
+    excess_vol   = np.nanstd(excess, ddof=1)
+    sharpe       = excess_mean / excess_vol if excess_vol not in (0, np.nan) else np.nan
+
+    # Jarque‑Bera
+    jb_stat, jb_p = stats.jarque_bera(series.dropna())
+
+    # Newey‑West HAC t‑statistic (3 lags)
+    nw_model = sm.OLS(series.dropna(), np.ones(len(series.dropna())))
+    nw_res   = nw_model.fit(cov_type="HAC", cov_kwds={"maxlags": 3})
+    nw_t     = nw_res.tvalues.iloc[0]
+    nw_p     = nw_res.pvalues.iloc[0]
+
+    return {
+        "Mean":               f"{mean_val:.4f}",
+        "Mean excess return": f"{excess_mean:.4f}",
+        "(p-value)":          f"({pval:.3f})",
+        "Median":             f"{median_val:.4f}",
+        "Volatility":         f"{vol:.4f}",
+        "Skewness":           f"{skewness:.4f}",
+        "Kurtosis":           f"{kurtosis:.4f}",
+        "Sharpe ratio":       f"{sharpe:.4f}",
+        "Jarque-Bera":        f"{jb_stat:.2f} (p={jb_p:.3f})",
+        "NW t‑stat":         f"{nw_t:.2f} (p={nw_p:.3f})"
+    }
+
+def display_statistics(stats: dict) -> None:
+    """Print summary statistics in identical table format."""
+    print("\n=== Benchmark Index Summary Statistics ===")
+    for metric, value in stats.items():
+        print(f"{metric:20s}: {value}")
+    print("==========================================\n")
+
+#============================
+#   MAIN EXECUTION
+#============================
+def main():
+    print("1) Loading raw data…")
+    rf_raw = load_raw_series(riskfree_data_path, "RF")
+    bm_raw = load_raw_series(benchmark_data_path, "Benchmark")
+
+    # 2) Filter on the **raw** dates first
+    print("2) Filtering to analysis window…")
+    start = pd.to_datetime(analysis_start)
+    end   = pd.to_datetime(analysis_end)
+    bm_filt = bm_raw.loc[bm_raw["Date"].between(start, end)].reset_index(drop=True)
+
+    # 3) Now snap those filtered dates to month‑end
+    print("3) Snapping to month‑end…")
+    bm_df = snap_to_month_end(bm_filt, "Date")
+    rf_df = snap_to_month_end(rf_raw, "Date")
+    #turn annualized EURIBOR into per‑month return
+    # Act/360: monthly return ≈ RF_ann * (days_in_month/360)
+    rf_df["Days"] = rf_df["Date"].dt.daysinmonth
+    rf_df["RF"] = rf_df["RF"] * rf_df["Days"] / 360
+
+    # 4) Merge & compute excess
+    print("4) Merging & computing excess return…")
+    merged = merge_with_riskfree(bm_df, rf_df)
+
+    # 5) Stats & output
+    stats = compute_statistics(merged["Benchmark"], merged["ExcessReturn"])
+    display_statistics(stats)
+
+    merged["Date"] = merged["Date"].dt.date
+    out_csv = results_dir / "Benchmark_Excess.csv"
+    merged.to_csv(out_csv, index=False)
+    print(f"Results saved to {out_csv}")
+
+if __name__ == "__main__":
+    main()
