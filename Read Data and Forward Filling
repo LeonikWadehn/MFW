@@ -1,0 +1,239 @@
+# =============================================================================
+# READ FILE
+# =============================================================================
+import pandas as pd
+
+# =============================================================================
+# 1. Load the New Excel File (with repeated blocks)
+# =============================================================================
+file_path = '/Users/leonikwadehn/Documents/Uni/ISEG/MFW/Python/Try 8/25.03.2025 Bloomberg New Fields Clean.xlsx'
+df = pd.read_excel(file_path, header=None)
+
+# Determine total number of columns and number of blocks.
+n_cols = df.shape[1]
+block_size = 14
+n_blocks = n_cols // block_size
+
+# =============================================================================
+# 2. Go Over Each Block, Drop the Empty Column, and Reshape to Long Format
+# =============================================================================
+blocks = []
+
+for block in range(n_blocks):
+    start_col = block * block_size
+    end_col = start_col + block_size
+    block_df = df.iloc[:, start_col:end_col].copy()
+    
+    # Drop the last column (always empty)
+    block_df = block_df.iloc[:, :13]
+    
+    # The first row of the block contains header information:
+    # Column 0 contains the Company Name; columns 1 to 12 contain the financial measure names.
+    company_name = block_df.iloc[0, 0]
+    measure_names = block_df.iloc[0, 1:].tolist()  # 12 measures
+    
+    # The data rows start from row 1 onward.
+    data_block = block_df.iloc[1:].copy()
+    
+    # Convert the first column (dates) to datetime.
+    data_block.iloc[:, 0] = pd.to_datetime(data_block.iloc[:, 0], errors='coerce')
+    
+    # Create a long-format DataFrame for each measure in the block.
+    block_long_list = []
+    for i, measure in enumerate(measure_names, start=1):
+        temp_df = pd.DataFrame({
+            'Date': data_block.iloc[:, 0],
+            'Company': company_name,
+            'Financial Measure': measure,
+            'Value': data_block.iloc[:, i]
+        })
+        block_long_list.append(temp_df)
+    
+    # Concatenate all measures for this company.
+    block_long = pd.concat(block_long_list, ignore_index=True)
+    blocks.append(block_long)
+
+# Concatenate all companies into one long DataFrame.
+df_long = pd.concat(blocks, ignore_index=True)
+
+print("Companies after reshaping:", df_long['Company'].nunique())
+print(df_long.head())
+
+# =============================================================================
+# 3. Expand each (Company, Financial Measure) to have a row for every month
+# =============================================================================
+
+# Ensure 'Date' is in datetime format
+df_long['Date'] = pd.to_datetime(df_long['Date'])
+
+# Convert to a monthly period (e.g., 2025-03) to unify months
+df_long['YearMonth'] = df_long['Date'].dt.to_period('M')
+
+# Resolve duplicates within the same (Company, Measure, YearMonth)
+# Sort so that 'last()' picks the most recent date in that month
+df_long = df_long.sort_values(['Company', 'Financial Measure', 'Date'])
+
+# Group by (Company, Financial Measure, YearMonth) and keep the last row
+df_long = (
+    df_long
+    .groupby(['Company', 'Financial Measure', 'YearMonth'], as_index=False)
+    .last()
+)
+
+# Determine the earliest and latest YearMonth across all data
+earliest = df_long['YearMonth'].min()
+latest = df_long['YearMonth'].max()
+
+# Create a monthly range covering the entire span
+all_months = pd.period_range(earliest, latest, freq='M')
+
+# Gather all unique companies and measures
+all_companies = df_long['Company'].unique()
+all_measures = df_long['Financial Measure'].unique()
+
+# Create a MultiIndex of all (Company, Financial Measure, YearMonth) combinations
+full_index = pd.MultiIndex.from_product(
+    [all_companies, all_measures, all_months],
+    names=['Company', 'Financial Measure', 'YearMonth']
+)
+
+# Now set the DataFrame's index and reindex to the full range
+df_long = (
+    df_long
+    .set_index(['Company', 'Financial Measure', 'YearMonth'])
+    .sort_index()
+    .reindex(full_index)
+    .reset_index()
+)
+
+# Convert the YearMonth period back to a Timestamp (end of month)
+df_long['Date'] = df_long['YearMonth'].dt.to_timestamp('M')
+df_long.drop(columns=['YearMonth'], inplace=True)
+
+
+print("Companies after monthly expansion:", df_long['Company'].nunique())
+pd.set_option('display.width', None)
+pd.set_option('display.expand_frame_repr', False)
+print(df_long.head(12))
+
+# =============================================================================
+# FORWARD FILL
+# =============================================================================
+
+import pandas as pd
+import numpy as np
+pd.set_option('future.no_silent_downcasting', True)
+
+# =============================================================================
+# Step 1: Forward-Fill with following Conditions on Monthly Data
+#   a) For "Dividends per Share": fill missing with 0
+#   b) For "Last Price" and "Historical Market Cap": do not forward-fill
+#   c) For all other measures: forward-fill only up to a maximum gap and not beyond
+#      the last valid "Last Price" date
+# =============================================================================
+def forward_fill_max_one_year_until_last_price(df, max_gap_days=366):
+    # Compute each company's last valid "Last Price"
+    last_price_dict = {}
+    for comp in df["Company"].unique():
+        valid_lp = df[
+            (df["Company"] == comp) &
+            (df["Financial Measure"] == "Last Price") &
+            (df["Value"].notna())
+        ]
+        if not valid_lp.empty:
+            last_price_dict[comp] = valid_lp["Date"].max()
+
+    groups = []
+    for (company, measure), group in df.groupby(["Company", "Financial Measure"]):
+        group = group.sort_values("Date").copy()
+
+        # (a) For Dividends per Share, fill missing with 0.
+        if measure == "Dividends per Share":
+            group["Value"] = group["Value"].fillna(0).astype(float)
+            groups.append(group)
+            continue
+
+        # (b) Do not forward-fill for Last Price or Historical Market Cap.
+        if measure in ["Last Price", "Historical Market Cap"]:
+            groups.append(group)
+            continue
+
+        # (c) For other measures, forward-fill
+        cutoff = last_price_dict.get(company, None)
+        if cutoff is None:
+            groups.append(group)
+            continue
+
+        filled_values = []
+        last_valid_date = None
+        last_valid_value = np.nan
+
+        for _, row in group.iterrows():
+            current_date = row["Date"]
+            if current_date > cutoff:
+                filled_values.append(np.nan)
+                continue
+
+            if pd.notna(row["Value"]):
+                last_valid_date = current_date
+                last_valid_value = row["Value"]
+                filled_values.append(row["Value"])
+            else:
+                if last_valid_date is not None and (current_date - last_valid_date).days <= max_gap_days:
+                    filled_values.append(last_valid_value)
+                else:
+                    filled_values.append(np.nan)
+
+        group["Value"] = filled_values
+        groups.append(group)
+
+    return pd.concat(groups, ignore_index=True)
+
+df_monthly_filled = forward_fill_max_one_year_until_last_price(df_long, max_gap_days=366)
+print(f"Companies after forward-filling: {df_monthly_filled['Company'].nunique()}")
+
+# =============================================================================
+# Step 2: Compute Missing "Historical Market Cap" Only
+#   If "Historical Market Cap" is missing, but there is Last Price and Shares Outstanding,
+#   then Historical Market Cap = Last Price * Shares Outstanding.
+# =============================================================================
+def compute_missing_market_cap(df):
+    # Pivot to wide for easier row-wise computation.
+    df_wide = df.pivot(index=["Company", "Date"], columns="Financial Measure", values="Value")
+    
+    def impute_market_cap(row):
+        if pd.isna(row.get("Historical Market Cap")) and \
+           pd.notna(row.get("Last Price")) and \
+           pd.notna(row.get("Shares Outstanding")):
+            row["Historical Market Cap"] = row["Last Price"] * row["Shares Outstanding"]
+        return row
+
+    df_wide = df_wide.apply(impute_market_cap, axis=1)
+
+    # Melt back to long format.
+    df_imputed = (
+        df_wide.reset_index()
+        .melt(id_vars=["Company", "Date"], var_name="Financial Measure", value_name="Value")
+    )
+    df_imputed.sort_values(by=["Company", "Date", "Financial Measure"], inplace=True)
+    return df_imputed
+
+df_monthly_filled = compute_missing_market_cap(df_monthly_filled)
+
+# =============================================================================
+# Step 3: Save the Processed Data and Print
+# =============================================================================
+filtered_parquet_path = "0. Prep Data.parquet"
+df_monthly_filled.to_parquet(filtered_parquet_path, engine="pyarrow", index=False)
+df_monthly_filled.to_csv("0. Prep Data.csv", index=False)
+print(f"Filtered data saved to '{filtered_parquet_path}' and '0. Prep Data.csv' successfully!")
+
+pd.set_option('display.width', None)
+pd.set_option('display.expand_frame_repr', False)
+print(df_monthly_filled.head(12))
+
+observed_count = df_monthly_filled.loc[
+    df_monthly_filled['Value'].notna() & (df_monthly_filled['Value'] != 0)
+].shape[0]
+
+print("Total number of observations:", observed_count)
