@@ -1,0 +1,147 @@
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+import scipy.stats as stats
+
+# -- 1) Load data --
+reit_file = '1. Total Return.parquet'
+long = pd.read_parquet(reit_file)
+
+# Pivot to wide format
+wide = long.pivot_table(
+    index=['Company', 'Date'],
+    columns='Financial Measure',
+    values='Value'
+).reset_index()
+
+# --- ALIGN REIT DATES TO MONTH-END FOR MERGE ---
+wide['Date'] = (
+    pd.to_datetime(wide['Date'])
+      .dt.to_period('M')
+      .dt.to_timestamp(how='end')
+)
+
+wide = wide.rename(columns={
+    'Historical Market Cap':                    'MarketCap',
+    'Total Equity':                             'TotalEquity',
+    'Preferred Equity and Hybrid Capital':        'PreferredEquityAndHybridCapital',
+    'Total Assets':                             'TotalAssets',
+    'Income (Loss) from Continuing Operations': 'Income',
+    'Total Return':                             'TotalReturn',
+    'Cash and Cash Equivalents':                'CashAndCashEq'
+})
+
+# -- 2) Load risk-free series (annualized) --
+rf_file = 'RF.xlsx'
+rf = pd.read_excel(rf_file, header=None)
+rf.columns = ['Date', 'RF_annual']
+
+rf['Date'] = (
+    pd.to_datetime(rf['Date'], errors='coerce')
+      .dt.to_period('M')
+      .dt.to_timestamp(how='end')
+)
+rf = rf.dropna(subset=['Date']).reset_index(drop=True)
+rf['Days'] = rf['Date'].dt.daysinmonth
+rf['RF'] = rf['RF_annual'] * rf['Days'] / 360
+rf = rf[['Date', 'RF']]
+
+# -- 3) Merge REIT & RF data --
+data = pd.merge(wide, rf, on='Date', how='left')
+
+# -- 4) Time-window filter --
+start_date = '2006-12-31'
+end_date   = '2024-12-31'
+mask = data['Date'].between(start_date, end_date)
+data = data.loc[mask].copy()
+
+# -- 5) Calculate characteristics --
+# 5a) Size
+data['size'] = (data['MarketCap'])
+
+# 5b) Book-to-Market (subtract preferred/hybrid from equity)
+data['BookEquity'] = data['TotalEquity'] - data['PreferredEquityAndHybridCapital']
+data['bm']        = data['BookEquity'] / data['MarketCap']
+
+# 5c) Momentum: 6-month cumprod of lagged returns, skipping the most recent month
+data['ret_lag1'] = data.groupby('Company')['TotalReturn'].shift(1)
+data['mom'] = (
+    data.groupby('Company')['ret_lag1']
+        .rolling(window=6, min_periods=6)
+        .apply(lambda x: np.prod(1 + x) - 1)
+        .reset_index(level=0, drop=True)
+)
+
+# 5d) Profitability: Income / lagged Book Equity
+data['BookEquity_lag1'] = data.groupby('Company')['BookEquity'].shift(3)
+data['roe'] = data['Income'] / data['BookEquity_lag1']
+
+# 5e) Investment: growth rate in non-cash assets = (NC_t / NC_{t–1}) – 1
+data['NCAssets']     = data['TotalAssets'] - data['CashAndCashEq']
+data['NCAssets_lag'] = data.groupby('Company')['NCAssets'].shift(3)
+data['inv_growth']   = data['NCAssets'] / data['NCAssets_lag'] - 1
+
+# -- 6) Next-month excess return (align RF and returns) --
+data['RF_next']  = data['RF'].shift(-1)
+data['ret_next'] = data.groupby('Company')['TotalReturn'].shift(-1)
+data['excess_return'] = data['ret_next'] - data['RF_next']
+
+# -- 7) Winsorize characteristics within each month --
+chars = ['size', 'bm', 'mom', 'roe', 'inv_growth']
+data[chars] = data.groupby('Date')[chars].transform(
+    lambda x: x.clip(x.quantile(0.0025), x.quantile(0.9975))
+)
+
+# -- 8) Clean up and drop incomplete observations --
+cols_needed = ['Date', 'Company', 'excess_return'] + chars
+data_cs = data.dropna(subset=cols_needed)[cols_needed]
+
+# -- 9) Fama–MacBeth time-series of cross-sectional betas --
+dates       = sorted(data_cs['Date'].unique())
+params_list = []
+
+for dt in dates:
+    df_t = data_cs[data_cs['Date'] == dt]
+    X = df_t[chars]
+    X = sm.add_constant(X)
+    y = df_t['excess_return']
+    model = sm.OLS(y, X).fit(cov_type='HC1')
+    params_list.append(model.params)
+
+df_params = pd.DataFrame(params_list, index=dates)
+
+# -- 10) Stage-2 statistics --
+gamma = df_params.mean()
+# classical SE (i.i.d.)
+se_iid = df_params.std(ddof=1) / np.sqrt(len(df_params))
+t_iid  = gamma / se_iid
+
+# Newey–West HAC(3)
+nw_se    = []
+nw_tstat = []
+for col in df_params.columns:
+    y = df_params[col].values
+    X2 = np.ones((len(y), 1))
+    res = sm.OLS(y, X2).fit(cov_type='HAC', cov_kwds={'maxlags': 3})
+    nw_se.append(res.bse[0])
+    nw_tstat.append(res.tvalues[0])
+
+results = pd.DataFrame({
+    'gamma':    gamma,
+    'se_NW(3)': nw_se,
+    't_stat':   nw_tstat
+})
+
+# -- 11) Print regression table in thesis format --
+table = results[['gamma','se_NW(3)','t_stat']].copy()
+table.columns = ['Coefficient (γ̂)', 'Newey–West SE', 't‐stat (NW)']
+
+print("\nTable X. Fama–MacBeth two‐pass estimates of prices of risk\n")
+print(table.round(4).to_string())
+
+# -- 12) Print sample dimensions --
+avg_N = data_cs.groupby('Date')['Company'].nunique().mean()
+T     = len(df_params)
+
+print(f"Average N per month: {avg_N:.0f}")
+print(f"T (number of months): {T}")
